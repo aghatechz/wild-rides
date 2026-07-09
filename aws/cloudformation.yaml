@@ -1,0 +1,277 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: AWS CloudFormation template for the Wild Ride (Wild Rydes) serverless application.
+
+Parameters:
+  UnicornsTableBillingMode:
+    Type: String
+    Default: PAY_PER_REQUEST
+    AllowedValues:
+      - PAY_PER_REQUEST
+      - PROVISIONED
+    Description: Billing mode for the DynamoDB table.
+
+Resources:
+  # 1. Cognito User Pool
+  WildRideUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: WildRideUserPool
+      UsernameAttributes:
+        - email
+      AutoVerifiedAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          RequireUppercase: true
+      Schema:
+        - Name: email
+          Required: true
+          Mutable: true
+
+  # 2. Cognito User Pool Client
+  WildRideUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: WildRideUserPoolWebClient
+      UserPoolId: !Ref WildRideUserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+
+  # 3. DynamoDB Table
+  RidesDynamoDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: Rides
+      AttributeDefinitions:
+        - AttributeName: RideId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: RideId
+          KeyType: HASH
+      BillingMode: !Ref UnicornsTableBillingMode
+
+  # 4. IAM Role for Lambda
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: WildRideLambdaRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBWritePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                Resource: !GetAtt RidesDynamoDBTable.Arn
+
+  # 5. Lambda Function (Inline Code)
+  WildRideLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: WildRideDispatchUnicorn
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: nodejs18.x
+      Timeout: 10
+      Environment:
+        Variables:
+          RIDES_TABLE: !Ref RidesDynamoDBTable
+      Code:
+        ZipFile: |
+          const { DynamoDBClient } = require("@aws-sdk/client-dynamodb");
+          const { DynamoDBDocumentClient, PutCommand } = require("@aws-sdk/lib-dynamodb");
+
+          const client = new DynamoDBClient({});
+          const ddbDocClient = DynamoDBDocumentClient.from(client);
+
+          const UNICORNS = [
+            { Name: "Shadowfax", Color: "White", Gender: "Male", Icon: "🦄" },
+            { Name: "Rainbow Dash", Color: "Blue", Gender: "Female", Icon: "🌈" },
+            { Name: "Rocinante", Color: "Grey", Gender: "Female", Icon: "🐴" },
+            { Name: "Binky", Color: "Cream", Gender: "Male", Icon: "✨" }
+          ];
+
+          exports.handler = async (event) => {
+            console.log("Received event:", JSON.stringify(event, null, 2));
+
+            // CORS headers
+            const corsHeaders = {
+              "Access-Control-Allow-Origin": "*",
+              "Access-Control-Allow-Headers": "Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token",
+              "Access-Control-Allow-Methods": "OPTIONS,POST"
+            };
+
+            if (event.httpMethod === "OPTIONS") {
+              return { statusCode: 200, headers: corsHeaders, body: "" };
+            }
+
+            try {
+              let body = {};
+              if (event.body) {
+                body = typeof event.body === "string" ? JSON.parse(event.body) : event.body;
+              }
+
+              const pickupLocation = body.PickupLocation;
+              if (!pickupLocation || !pickupLocation.Latitude || !pickupLocation.Longitude) {
+                return {
+                  statusCode: 400,
+                  headers: corsHeaders,
+                  body: JSON.stringify({ Error: "Missing Latitude/Longitude coordinate inputs." })
+                };
+              }
+
+              const unicorn = UNICORNS[Math.floor(Math.random() * UNICORNS.length)];
+              const rideId = Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15);
+              const username = event.requestContext?.authorizer?.claims?.["cognito:username"] || "anonymous_rider";
+
+              const rideRecord = {
+                RideId: rideId,
+                Rider: username,
+                Unicorn: unicorn,
+                PickupLocation: pickupLocation,
+                RequestTime: new Date().toISOString()
+              };
+
+              await ddbDocClient.send(
+                new PutCommand({
+                  TableName: process.env.RIDES_TABLE || "Rides",
+                  Item: rideRecord
+                })
+              );
+
+              return {
+                statusCode: 201,
+                headers: corsHeaders,
+                body: JSON.stringify({
+                  RideId: rideId,
+                  Unicorn: unicorn,
+                  Eta: "2 minutes",
+                  Rider: username
+                })
+              };
+            } catch (error) {
+              console.error(error);
+              return {
+                statusCode: 500,
+                headers: corsHeaders,
+                body: JSON.stringify({ Error: "Server error occurred", Message: error.message })
+              };
+            }
+          };
+
+  # 6. API Gateway REST API
+  WildRideApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: WildRideApi
+      Description: API Gateway REST endpoint for Wild Ride Unicorn dispatcher.
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  # API Gateway Resource: /ride
+  RideApiResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt WildRideApi.RootResourceId
+      PathPart: ride
+      RestApiId: !Ref WildRideApi
+
+  # API Gateway Cognito Authorizer
+  ApiUserPoolAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Properties:
+      Name: WildRideUserPoolAuthorizer
+      Type: COGNITO_USER_POOLS
+      ProviderARNs:
+        - !GetAtt WildRideUserPool.Arn
+      IdentitySource: method.request.header.Authorization
+      RestApiId: !Ref WildRideApi
+
+  # API Gateway POST Method
+  RideApiPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref ApiUserPoolAuthorizer
+      HttpMethod: POST
+      ResourceId: !Ref RideApiResource
+      RestApiId: !Ref WildRideApi
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${WildRideLambdaFunction.Arn}/invocations
+
+  # API Gateway OPTIONS Method (For pre-flight CORS verification)
+  RideApiOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: OPTIONS
+      ResourceId: !Ref RideApiResource
+      RestApiId: !Ref WildRideApi
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${WildRideLambdaFunction.Arn}/invocations
+
+  # Lambda Permissions to allow API Gateway to invoke Lambda
+  LambdaPermissionForApiGateway:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt WildRideLambdaFunction.Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WildRideApi}/*
+
+  # API Deployment
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - RideApiPostMethod
+      - RideApiOptionsMethod
+    Properties:
+      RestApiId: !Ref WildRideApi
+
+  # API Stage: prod
+  ApiStageProd:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      DeploymentId: !Ref ApiDeployment
+      RestApiId: !Ref WildRideApi
+      StageName: prod
+
+Outputs:
+  Region:
+    Value: !Ref AWS::Region
+    Description: AWS region deployed in.
+
+  CognitoUserPoolId:
+    Value: !Ref WildRideUserPool
+    Description: Cognito User Pool ID.
+
+  CognitoUserPoolClientId:
+    Value: !Ref WildRideUserPoolClient
+    Description: Cognito User Pool App Client ID.
+
+  ApiGatewayUrl:
+    Value: !Sub https://${WildRideApi}.execute-api.${AWS::Region}.amazonaws.com/prod/ride
+    Description: API Gateway endpoint URL for ride requests.
